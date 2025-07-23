@@ -26,8 +26,11 @@ struct Args {
     #[arg(short = 's', long, default_value_t = 56, help = "ICMP payload size")]
     packet_size: usize,
 
-    #[arg(short, long, default_value = "ping_history.json", help = "Output JSON file")]
+    #[arg(short, long, default_value = "ping_history.json", help = "Output file")]
     output: String,
+
+    #[arg(short = 'f', long, default_value = "json", help = "Output format: json or csv")]
+    format: String,
 
     #[arg(short, long, help = "Output directory (default: current dir)")]
     directory: Option<PathBuf>,
@@ -53,8 +56,9 @@ impl PingStats {
     // Creates a new, empty stats object for a session.
     fn new(target: String) -> Self {
         let buckets = [
-            "< 100ms", "100-199ms", "200-299ms", "300-399ms",
-            "400-499ms", "500-999ms", ">= 1000ms",
+            "0-50ms", "50-100ms", "100-150ms", "150-200ms", "200-250ms",
+            "250-300ms", "300-350ms", "350-400ms", "400-450ms", "450-500ms",
+            "500-999ms", ">1000ms",
         ]
         .iter()
         .map(|s| (s.to_string(), 0))
@@ -87,22 +91,27 @@ impl PingStats {
             self.max = None;
             self.avg = None;
         } else {
-            self.min = Some(times.iter().fold(f32::MAX, |a, &b| a.min(b)));
-            self.max = Some(times.iter().fold(f32::MIN, |a, &b| a.max(b)));
-            self.avg = Some(times.iter().sum::<f32>() / times.len() as f32);
+            self.min = Some((times.iter().fold(f32::MAX, |a, &b| a.min(b)) * 100.0).round() / 100.0);
+            self.max = Some((times.iter().fold(f32::MIN, |a, &b| a.max(b)) * 100.0).round() / 100.0);
+            self.avg = Some((times.iter().sum::<f32>() / times.len() as f32 * 100.0).round() / 100.0);
         }
 
         // Recalculate latency distribution buckets
         self.latency_buckets.values_mut().for_each(|v| *v = 0);
         for &time in times {
             let bucket = match time as u64 {
-                0..=99 => "< 100ms",
-                100..=199 => "100-199ms",
-                200..=299 => "200-299ms",
-                300..=399 => "300-399ms",
-                400..=499 => "400-499ms",
+                0..=49 => "0-50ms",
+                50..=99 => "50-100ms",
+                100..=149 => "100-150ms",
+                150..=199 => "150-200ms",
+                200..=249 => "200-250ms",
+                250..=299 => "250-300ms",
+                300..=349 => "300-350ms",
+                350..=399 => "350-400ms",
+                400..=449 => "400-450ms",
+                450..=499 => "450-500ms",
                 500..=999 => "500-999ms",
-                _ => ">= 1000ms",
+                _ => ">1000ms",
             };
             *self.latency_buckets.entry(bucket.to_string()).or_insert(0) += 1;
         }
@@ -128,6 +137,58 @@ fn save_results(stats: &PingStats, path: &Path) -> Result<()> {
     let writer = BufWriter::new(file);
     serde_json::to_writer_pretty(writer, &entries)?;
     Ok(())
+}
+
+// Saves the statistics by appending a new entry to the CSV file.
+fn save_results_csv(stats: &PingStats, path: &Path) -> Result<()> {
+    let file_exists = path.exists();
+    let file = OpenOptions::new().write(true).create(true).append(true).open(path)?;
+    let mut writer = csv::Writer::from_writer(file);
+
+    // Write header if file is new
+    if !file_exists {
+        writer.write_record(&[
+            "target", "timestamp", "sent", "received", "loss_percent", 
+            "min", "max", "avg", "0-50ms", "50-100ms", "100-150ms", 
+            "150-200ms", "200-250ms", "250-300ms", "300-350ms", 
+            "350-400ms", "400-450ms", "450-500ms", "500-999ms", ">1000ms"
+        ])?;
+    }
+
+    // Write data row
+    let bucket_order = [
+        "0-50ms", "50-100ms", "100-150ms", "150-200ms", "200-250ms",
+        "250-300ms", "300-350ms", "350-400ms", "400-450ms", "450-500ms",
+        "500-999ms", ">1000ms"
+    ];
+    
+    let mut record = vec![
+        stats.target.clone(),
+        stats.timestamp.to_rfc3339(),
+        stats.sent.to_string(),
+        stats.received.to_string(),
+        format!("{:.2}", stats.loss_percent),
+        stats.min.map_or("".to_string(), |v| format!("{:.2}", v)),
+        stats.max.map_or("".to_string(), |v| format!("{:.2}", v)),
+        stats.avg.map_or("".to_string(), |v| format!("{:.2}", v)),
+    ];
+    
+    for bucket in &bucket_order {
+        record.push(stats.latency_buckets.get(*bucket).unwrap_or(&0).to_string());
+    }
+    
+    writer.write_record(&record)?;
+    writer.flush()?;
+    Ok(())
+}
+
+// Generic save function that delegates to JSON or CSV based on file extension
+fn save_results_generic(stats: &PingStats, path: &Path) -> Result<()> {
+    if path.extension().and_then(|s| s.to_str()) == Some("csv") {
+        save_results_csv(stats, path)
+    } else {
+        save_results(stats, path)
+    }
 }
 
 fn print_current_results(stats: &PingStats) {
@@ -168,12 +229,18 @@ fn validate_float(prompt: &str, default: f64) -> f64 {
     input.parse::<f64>().unwrap_or_else(|_| { println!("Invalid input, using default {:.1}.", default); default })
 }
 
-fn validate_filename(prompt: &str, default: String) -> String {
+fn validate_filename(prompt: &str, default: String, format: &str) -> String {
     print!("{}", prompt);
     io::stdout().flush().unwrap();
     let mut name = read_line();
     if name.is_empty() { return default; }
-    if !name.to_lowercase().ends_with(".json") { name.push_str(".json"); }
+    let extension = match format {
+        "csv" => ".csv",
+        _ => ".json",
+    };
+    if !name.to_lowercase().ends_with(extension) { 
+        name.push_str(extension); 
+    }
     name
 }
 
@@ -188,7 +255,22 @@ fn main() -> Result<()> {
         args.count = validate_int("Number of packets (empty=continuous): ", None, 1);
         args.timeout = validate_float(&format!("Timeout in seconds (default {}): ", args.timeout), args.timeout);
         if let Some(val) = validate_int(&format!("Packet size bytes (default {}): ", args.packet_size), Some(args.packet_size), 0) { args.packet_size = val; }
-        args.output = validate_filename(&format!("Results filename (default {}): ", args.output), args.output);
+        
+        // Validate format first
+        print!("Output format [json/csv] (default json): ");
+        io::stdout().flush().unwrap();
+        let format_input = read_line();
+        if !format_input.is_empty() && (format_input.to_lowercase() == "csv" || format_input.to_lowercase() == "json") {
+            args.format = format_input.to_lowercase();
+        }
+        
+        // Update default filename based on format
+        let default_filename = match args.format.as_str() {
+            "csv" => "ping_history.csv".to_string(),
+            _ => "ping_history.json".to_string(),
+        };
+        args.output = validate_filename(&format!("Results filename (default {}): ", default_filename), default_filename, &args.format);
+        
         let dir_str = { print!("Directory to save (default current dir): "); io::stdout().flush().unwrap(); read_line() };
         if !dir_str.is_empty() { args.directory = Some(PathBuf::from(dir_str)); }
         args.save_interval = validate_int("Auto-save interval in seconds (empty=disabled): ", None, 1);
@@ -217,6 +299,15 @@ async fn run_ping(args: Args) -> Result<()> {
         None => PathBuf::from(&args.output),
     };
 
+    // Ensure the output file has the correct extension based on format
+    let final_save_path = if args.format == "csv" && !save_path.to_string_lossy().ends_with(".csv") {
+        save_path.with_extension("csv")
+    } else if args.format == "json" && !save_path.to_string_lossy().ends_with(".json") {
+        save_path.with_extension("json")
+    } else {
+        save_path
+    };
+
     // Shared state for the current session.
     let session_stats = Arc::new(Mutex::new(PingStats::new(ip_addr.to_string())));
     let session_times = Arc::new(Mutex::new(Vec::<f32>::new()));
@@ -226,13 +317,13 @@ async fn run_ping(args: Args) -> Result<()> {
     // Set up Ctrl+C handler
     let stats_clone_ctrlc = Arc::clone(&session_stats);
     let times_clone_ctrlc = Arc::clone(&session_times);
-    let save_path_clone_ctrlc = save_path.clone();
+    let save_path_clone_ctrlc = final_save_path.clone();
     ctrlc::set_handler(move || {
         println!("\nInterrupted by user. Saving results...");
         let mut stats = stats_clone_ctrlc.lock().unwrap();
         let times = times_clone_ctrlc.lock().unwrap();
         stats.calculate(&times); // Final calculation before saving
-        if let Err(e) = save_results(&stats, &save_path_clone_ctrlc) {
+        if let Err(e) = save_results_generic(&stats, &save_path_clone_ctrlc) {
             eprintln!("Failed to save results on exit: {}", e);
         } else {
             println!("Results saved to {}", save_path_clone_ctrlc.display());
@@ -281,10 +372,10 @@ async fn run_ping(args: Args) -> Result<()> {
                 interval_stat.sent = interval_sent;
                 interval_stat.calculate(&interval_times);
 
-                if let Err(e) = save_results(&interval_stat, &save_path) {
+                if let Err(e) = save_results_generic(&interval_stat, &final_save_path) {
                     eprintln!("Failed to auto-save results: {}", e);
                 } else {
-                    println!("\n--- Auto-saved interval results to {} ---\n", save_path.display());
+                    println!("\n--- Auto-saved interval results to {} ---\n", final_save_path.display());
                 }
                 
                 // Reset interval-specific state
@@ -303,10 +394,10 @@ async fn run_ping(args: Args) -> Result<()> {
     stats_guard.calculate(&times_guard);
 
     if stats_guard.sent > 0 {
-        if let Err(e) = save_results(&stats_guard, &save_path) {
+        if let Err(e) = save_results_generic(&stats_guard, &final_save_path) {
             eprintln!("Failed to save final results: {}", e);
         } else {
-            println!("Final results saved to {}", save_path.display());
+            println!("Final results saved to {}", final_save_path.display());
         }
         print_current_results(&stats_guard);
     }
