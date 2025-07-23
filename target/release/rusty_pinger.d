@@ -1,1 +1,1 @@
-C:\Users\alexe\Desktop\rusty_pinger\target\release\rusty_pinger.exe: C:\Users\alexe\Desktop\rusty_pinger\src\main.rs
+/home/runner/work/rusty_pinger/rusty_pinger/target/release/rusty_pinger: /home/runner/work/rusty_pinger/rusty_pinger/src/main.rs
